@@ -195,7 +195,7 @@ jobs:
       - flutter-checks
       - native-tests
       - android-go-tests
-      
+      - android-unit-tests
 
     steps:
       - name: Checkout
