@@ -427,7 +427,9 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
   int lcp_out_include_ac = 1;
   int lcp_peer_framing_seen = 0;
   int lcp_accm_in_cr = 1;
-  int lcp_auth_in_cr = 1;
+  /* Client side must not ask the server to authenticate itself: the auth protocol is chosen by the server's own
+   * Configure-Request (pppd on EdgeOS/USG Naks or ignores a client-proposed MS-CHAPv2). */
+  int lcp_auth_in_cr = 0;
   /* Phase 1: send initial Configure-Request. */
   int plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, 1, lcp_accm_in_cr, lcp_auth_in_cr);
   if (plen < 0)
@@ -443,12 +445,18 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
   int got_ack = 0;
   int peer_cr_hex_done = 0;
   int applied_peer_lcp_auth_hint = 0;
-  int pending_resend_cr_after_ack = 0;
   /* Phase 2: bounded receive/process loop until our current request id is acknowledged. */
-  for (int round = 0; round < 16 && !got_ack; round++) {
-    int n = recv_ppp(esp_fd, esp, l2tp, in, sizeof(in), 4000);
+  for (int round = 0; round < 24 && !got_ack; round++) {
+    int n = recv_ppp(esp_fd, esp, l2tp, in, sizeof(in), 3000);
     if (n < 8) {
       tunnel_engine_log(ANDROID_LOG_WARN, LOG_TAG, "ppp lcp: recv below minimum n=%d round=%d", n, round);
+      if (tunnel_should_stop())
+        return -1;
+      /* RFC 1661 Restart timer: our CR may have been sent before the server's pppd was attached to the session. */
+      if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
+        return -1;
+      tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "ppp lcp: timeout, retransmit Configure-Request id=%u",
+                        (unsigned)id);
       continue;
     }
     const uint8_t *p = in;
@@ -498,7 +506,6 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
             plen = lcp_build_cr(pkt, sizeof(pkt), id, auth, cr_mru, lcp_out_include_ac, lcp_accm_in_cr, lcp_auth_in_cr);
             if (plen < 0)
               return -1;
-            pending_resend_cr_after_ack = 1;
             tunnel_engine_log(
                 ANDROID_LOG_DEBUG, LOG_TAG,
                 "ppp lcp: align auth to peer want=%s peer_mru=%u keep_mru=%u new Configure-Request id=%u auth_in_cr=%d",
@@ -517,13 +524,12 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
       ackbuf[prefix + 2u] = 2;
       if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, ackbuf, total_ack) < 0)
         return -1;
-      if (pending_resend_cr_after_ack) {
-        pending_resend_cr_after_ack = 0;
-        if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
-          return -1;
-        tunnel_engine_log(ANDROID_LOG_DEBUG, LOG_TAG, "ppp lcp: sent aligned Configure-Request id=%u bytes=%d",
-                          (unsigned)id, plen);
-      }
+      /* Peer re-sending its CR means it has not seen ours yet (state Ack-Sent/Req-Sent): always (re)send our
+       * current Configure-Request, otherwise both sides wait forever and LCP times out. */
+      if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
+        return -1;
+      tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "ppp lcp: acked peer CR id=%u, sent our Configure-Request id=%u",
+                        (unsigned)rid, (unsigned)id);
       continue;
     }
     if (code == 2 && rid == id) {
@@ -565,6 +571,8 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
     if (code == 3 && rid == id) {
       /* Configure-Nak: adopt suggested auth family and resend with next id. */
       uint16_t lcp_len = util_read_be16(p + 4);
+      if (lcp_len >= 6 && (size_t)lcp_len <= len)
+        lcp_auth_in_cr = 0; /* auth is decided by the server's CR, never by ours */
       if (lcp_len >= 6 && (size_t)lcp_len <= len) {
         if (lcp_nak_wants_pap(p + 6, (size_t)lcp_len - 6)) {
           auth = PPP_AUTH_PAP;
