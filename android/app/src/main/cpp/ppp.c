@@ -771,7 +771,9 @@ static int ppp_auth_mschapv2(int esp_fd, esp_keys_t *esp, const struct sockaddr 
     if (plen < 8 || plen > len)
       continue;
     uint8_t vs = p[6];
-    if (vs != 16 || (size_t)plen < 7u + vs)
+    /* plen is the CHAP Length field (code+id+length+value-size+value+name); it excludes the 2-byte PPP protocol.
+     * The old check (7 + vs) silently dropped challenges without a Name field, which mpd5 (pfSense) sends. */
+    if (vs != 16 || (size_t)plen < 5u + vs || (size_t)plen + 2u > len)
       continue;
     const uint8_t *auth_chal = p + 7;
     uint8_t peer_chal[16];
@@ -855,7 +857,7 @@ static int ppp_auth_chap_md5(int esp_fd, esp_keys_t *esp, const struct sockaddr 
     if (plen < 8 || plen > len)
       continue;
     uint8_t vs = p[6];
-    if (vs == 0 || (size_t)plen < 7u + vs)
+    if (vs == 0 || (size_t)plen < 5u + vs || (size_t)plen + 2u > len)
       continue;
     const uint8_t *chal = p + 7;
     uint8_t md[16];
