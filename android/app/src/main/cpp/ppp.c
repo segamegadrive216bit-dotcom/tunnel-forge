@@ -1,7 +1,7 @@
 /*
  * PPP over L2TP data channel: LCP, authentication (PAP, MS-CHAPv2, CHAP-MD5), IPCP for IPv4,
  * then IP frames (0x0021) to/from the TUN fd. recv_ppp loops on the ESP socket until a PPP frame
- * for the current L2TP session is available.
+ * for the current L2TP session is available..
  */
 #include "ppp.h"
 
