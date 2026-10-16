@@ -635,6 +635,13 @@ static int l2tp_handshake_inner(int esp_fd, esp_keys_t *esp, const struct sockad
   ao = 0;
   avp_u16(avps, &ao, L2TP_AVP_MSG_TYPE, L2TP_MSG_ICCN);
   avp_u16(avps, &ao, L2TP_AVP_ASSIGNED_SESSION, local_sid);
+  /* RFC 2661 sec 6.7: ICCN MUST carry (Tx) Connect Speed (AVP 24) and Framing Type (AVP 19).
+   * Strict LNS implementations (mpd5 on pfSense/FreeBSD) drop the tunnel with
+   * "rec'd ICCN control message lacking required AVP #24" when they are missing. */
+  if (l2tp_avp_append_u32(avps, sizeof(avps), &ao, 24, 100000000u) != 0) /* Tx Connect Speed, bps */
+    return -1;
+  if (l2tp_avp_append_u32(avps, sizeof(avps), &ao, 19, 3u) != 0) /* Framing Type: sync | async */
+    return -1;
   if (send_ctrl(esp_fd, esp, peer, peer_len, s, avps, ao) != 0)
     return -1;
 
