@@ -78,6 +78,10 @@ static void ppp_log_rx_summary(const uint8_t *p, size_t len, const char *stage) 
                     (unsigned)proto, (unsigned)code, (unsigned)id, len);
 }
 
+static int lcp_build_reject_for_unsupported(const uint8_t *frame, size_t prefix, const uint8_t *body, size_t body_len,
+                                            uint8_t *out, size_t cap);
+static int s_lcp_late_cr_ack;
+
 static long long ppp_now_ms(void) {
   struct timeval now;
   gettimeofday(&now, NULL);
@@ -182,6 +186,29 @@ static int recv_ppp(int esp_fd, esp_keys_t *esp, const struct sockaddr *peer, so
       tunnel_engine_log(ANDROID_LOG_WARN, LOG_TAG, "ppp recv l2tp not-ppp-data flags=0x%04x plen=%zu", (unsigned)flags,
                         plen);
       continue;
+    }
+    if (s_lcp_late_cr_ack && peer != NULL) {
+      const uint8_t *lb = ppp_ptr;
+      size_t ll = ppp_len;
+      size_t pre = 0;
+      if (ll >= 2u && lb[0] == 0xff && lb[1] == 0x03) {
+        pre = 2u;
+      }
+      if (ll >= pre + 6u && util_read_be16(lb + pre) == PROTO_LCP && lb[pre + 2u] == 1u) {
+        uint8_t rsp[256];
+        int rl = lcp_build_reject_for_unsupported(lb, pre, lb + pre, ll - pre, rsp, sizeof(rsp));
+        if (rl == 0 && ll <= sizeof(rsp)) {
+          memcpy(rsp, lb, ll);
+          rsp[pre + 2u] = 2u; /* Configure-Ack */
+          rl = (int)ll;
+        }
+        if (rl > 0) {
+          (void)l2tp_send_ppp(esp_fd, esp, peer, peer_len, l2tp, rsp, (size_t)rl);
+          tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "ppp: answered late LCP Configure-Request id=%u (%s)",
+                            (unsigned)lb[pre + 3u], rsp[pre + 2u] == 2u ? "ack" : "reject");
+        }
+        continue;
+      }
     }
     if (ppp_len > cap)
       return -1;
@@ -409,6 +436,53 @@ static void lcp_apply_conf_reject(const uint8_t *lcp, size_t lcp_len, int *inclu
 }
 
 /**
+ * Build an LCP Configure-Reject for peer Configure-Request options this client does not implement:
+ * Callback (13), Multilink MRRU (17) and Multilink Short Sequence Number Header (18). Acking MRRU would
+ * enable Multilink PPP on the server (mpd5 on pfSense proposes it), after which it may wrap data in MP headers.
+ * @param frame full PPP frame as received (optional ff 03 + 2-byte protocol + LCP), @param body points at protocol.
+ * @return reject frame length (>0) when something must be rejected, 0 when the request can be acked, -1 on error.
+ */
+static int lcp_build_reject_for_unsupported(const uint8_t *frame, size_t prefix, const uint8_t *body, size_t body_len,
+                                            uint8_t *out, size_t cap) {
+  if (body_len < 6u)
+    return -1;
+  uint16_t lcp_len = util_read_be16(body + 4);
+  if (lcp_len < 4u || 2u + (size_t)lcp_len > body_len || prefix + 6u > cap)
+    return -1;
+  memcpy(out, frame, prefix + 2u); /* address/control (if any) + protocol */
+  size_t o = prefix + 2u;
+  out[o++] = 4; /* Configure-Reject */
+  out[o++] = body[3];
+  size_t len_pos = o;
+  o += 2u;
+  const uint8_t *opts = body + 6u;
+  size_t rem = (size_t)lcp_len - 4u;
+  size_t i = 0;
+  int rejected = 0;
+  while (i + 2u <= rem) {
+    uint8_t t = opts[i];
+    uint8_t ol = opts[i + 1u];
+    if (ol < 2u || i + (size_t)ol > rem)
+      break;
+    if (t == 13u || t == 17u || t == 18u) {
+      if (o + ol > cap)
+        return -1;
+      memcpy(out + o, opts + i, ol);
+      o += ol;
+      rejected = 1;
+    }
+    i += (size_t)ol;
+  }
+  if (!rejected)
+    return 0;
+  util_write_be16(out + len_pos, (uint16_t)(o - prefix - 2u));
+  return (int)o;
+}
+
+/* Set once LCP is negotiated: late peer Configure-Requests (retransmits that crossed our Ack) are acked
+ * inside recv_ppp() so the server does not time out LCP while we wait for CHAP/IPCP. */
+
+/**
  * Negotiate LCP open state for the PPP link on the current L2TP session.
  *
  * The routine drives only the LCP Configure-Request handshake phase:
@@ -457,8 +531,12 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
   int got_ack = 0;
   int peer_cr_hex_done = 0;
   int applied_peer_lcp_auth_hint = 0;
-  /* Phase 2: bounded receive/process loop until our current request id is acknowledged. */
-  for (int round = 0; round < 24 && !got_ack; round++) {
+  int peer_cr_acked = 0;
+  s_lcp_late_cr_ack = 0;
+  /* Phase 2: bounded receive/process loop until BOTH our Configure-Request is acked and we have acked the peer's
+   * (RFC 1661 Opened state). Stopping after our own Ack drops the server's CR (e.g. mpd5 on pfSense) and the
+   * server then tears the call down after its LCP retries while we already wait for CHAP. */
+  for (int round = 0; round < 24 && !(got_ack && peer_cr_acked); round++) {
     int n = recv_ppp(esp_fd, esp, peer, peer_len, l2tp, in, sizeof(in), 3000);
     if (n == -2)
       return -1;
@@ -467,10 +545,12 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
       if (tunnel_should_stop())
         return -1;
       /* RFC 1661 Restart timer: our CR may have been sent before the server's pppd was attached to the session. */
-      if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
-        return -1;
-      tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "ppp lcp: timeout, retransmit Configure-Request id=%u",
-                        (unsigned)id);
+      if (!got_ack) {
+        if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
+          return -1;
+        tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "ppp lcp: timeout, retransmit Configure-Request id=%u",
+                          (unsigned)id);
+      }
       continue;
     }
     const uint8_t *p = in;
@@ -527,6 +607,18 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
           }
         }
       }
+      {
+        uint8_t rejbuf[256];
+        int rl = lcp_build_reject_for_unsupported(in, (size_t)(p - in), p, len, rejbuf, sizeof(rejbuf));
+        if (rl > 0) {
+          if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, rejbuf, (size_t)rl) < 0)
+            return -1;
+          tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG,
+                            "ppp lcp: rejected unsupported options (Multilink/Callback) in peer CR id=%u",
+                            (unsigned)rid);
+          continue;
+        }
+      }
       size_t ack_ppp_len = 2u + (size_t)lcp_len;
       size_t prefix = (size_t)(p - in);
       size_t total_ack = prefix + ack_ppp_len;
@@ -538,18 +630,19 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
       ackbuf[prefix + 2u] = 2;
       if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, ackbuf, total_ack) < 0)
         return -1;
-      /* Peer re-sending its CR means it has not seen ours yet (state Ack-Sent/Req-Sent): always (re)send our
-       * current Configure-Request, otherwise both sides wait forever and LCP times out. */
-      if (send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
+      peer_cr_acked = 1;
+      /* Peer re-sending its CR while ours is not acked yet means it has not seen ours: (re)send it, otherwise
+       * both sides wait forever. Once ours is acked, resending would restart negotiation on the server. */
+      if (!got_ack && send_ppp(esp_fd, esp, peer, peer_len, l2tp, pkt, (size_t)plen) < 0)
         return -1;
       tunnel_engine_log(ANDROID_LOG_INFO, LOG_TAG, "ppp lcp: acked peer CR id=%u, sent our Configure-Request id=%u",
                         (unsigned)rid, (unsigned)id);
       continue;
     }
     if (code == 2 && rid == id) {
-      /* Terminal condition: our current Configure-Request is acknowledged. */
+      /* Our current Configure-Request is acknowledged; loop ends once the peer's CR is acked too. */
       got_ack = 1;
-      break;
+      continue;
     }
     if (code == 4 && rid == id) {
       /* Configure-Reject: remove rejected options and resend with next id. */
@@ -606,6 +699,8 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
         return -1;
     }
   }
+  if (got_ack && !peer_cr_acked)
+    tunnel_engine_log(ANDROID_LOG_WARN, LOG_TAG, "ppp lcp: our CR acked but no peer Configure-Request seen; continuing");
   if (!got_ack) {
     /* Round budget exhausted without Configure-Ack for our request id. */
     tunnel_engine_log(ANDROID_LOG_ERROR, LOG_TAG, "ppp: LCP timeout");
@@ -615,6 +710,7 @@ static int ppp_lcp_negotiate(int esp_fd, esp_keys_t *esp, const struct sockaddr 
                     ppp_auth_name(auth), ppp != NULL ? ppp->lcp_acfc : -1, ppp != NULL ? ppp->lcp_pfc : -1,
                     (unsigned)cr_mru);
   *auth_out = auth;
+  s_lcp_late_cr_ack = 1;
   return 0;
 }
 
